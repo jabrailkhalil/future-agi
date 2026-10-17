@@ -1,0 +1,96 @@
+name: Tool parameter regression
+
+on:
+  push:
+    branches: [validation/tool-params-20261018]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: source/futureagi
+    env:
+      LITELLM_MODE: PRODUCTION
+      CH25_DATABASE: test_tfc
+      CH_DATABASE: test_tfc
+      OBSERVED_CATALOG_TEST_CH_HOST: 127.0.0.1
+      OBSERVED_CATALOG_TEST_CH_PORT: "18123"
+      OBSERVED_CATALOG_TEST_CH_USER: default
+      OBSERVED_CATALOG_TEST_CH_PASSWORD: ""
+      OBSERVED_CATALOG_TEST_NATIVE_PORT: "19000"
+      FI_CH_TEST_SIDECAR_NATIVE_PORT: "19000"
+      FI_CH_TEST_SIDECAR_HTTP_PORT: "18123"
+      PYTHONHASHSEED: "0"
+      FI_CH25_SCHEMA_APPLY_STRICT: "1"
+      MINIO_URL: localhost:19005
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: b15b25d5f3d87875f0188be8c1f50a51c35ea4fa
+          path: source
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Record tested source
+        working-directory: source
+        run: |
+          mkdir -p ../evidence
+          git rev-parse HEAD | tee ../evidence/source-sha.txt
+          git ls-tree -r HEAD > ../evidence/source-tree.txt
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: source/futureagi/uv.lock
+      - name: Install runtime libraries
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg xmlsec1
+      - name: Frozen dependencies
+        run: uv sync --frozen --all-extras --python 3.12
+      - name: Start real disposable test services
+        run: docker compose -f docker-compose.test.yml -p futureagi-test up -d --wait --wait-timeout 180
+      - name: Prove regression against original source
+        run: |
+          git show 90e948a5fa72a61e3e428e965a3d3e31ba765717:futureagi/ai_tools/base.py > ai_tools/base.py
+          set +e
+          uv run pytest -q -ra ai_tools/tests/test_base_params.py ai_tools/tests/test_context_tools.py::TestSearchTool \
+            --junitxml=../../evidence/original.xml 2>&1 | tee ../../evidence/original.txt
+          result=${PIPESTATUS[0]}
+          set -e
+          git restore ai_tools/base.py
+          test "$result" -eq 1
+          uv run python - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse('../../evidence/original.xml').getroot()
+          cases = list(root.iter('testcase'))
+          failures = [case for case in cases if case.find('failure') is not None]
+          errors = list(root.iter('error'))
+          skips = list(root.iter('skipped'))
+          assert len(cases) == 6, len(cases)
+          assert len(failures) == 4, [(case.get('name'), list(case)) for case in cases]
+          assert not errors and not skips, (errors, skips)
+          assert all('string_type' in ''.join(case.itertext()) for case in failures)
+          print('Original source: 4 expected regression failures, 2 passing controls, no collection errors/skips')
+          PY
+      - name: Run affected tool suites
+        run: |
+          uv run pytest -q -ra ai_tools/tests/test_base_params.py ai_tools/tests/test_context_tools.py \
+            ai_tools/tests/test_registry.py ai_tools/tests/test_generated_tools.py \
+            --junitxml=../../evidence/fixed.xml 2>&1 | tee ../../evidence/fixed.txt
+      - name: Check clean source
+        run: git diff --exit-code
+      - name: Logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.test.yml -p futureagi-test logs --tail 80
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tool-parameter-regression
+          path: evidence/
+          if-no-files-found: error
