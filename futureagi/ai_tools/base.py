@@ -180,18 +180,27 @@ class BaseTool(ABC):
                 error_code=code_from_exception(e),
             )
 
-    @staticmethod
-    def _clean_params(raw_params: dict) -> dict:
+    def _clean_params(self, raw_params: dict) -> dict:
         """Pre-process tool parameters to handle common LLM quirks.
 
         LLMs sometimes send stringified JSON for list/dict fields.
-        This attempts to parse string values that look like JSON.
+        Preserve literal JSON text when the input schema accepts a string.
         """
         import json
 
+        string_fields = {
+            name
+            for name, spec in self.input_schema.get("properties", {}).items()
+            if spec.get("type") == "string"
+            or any(part.get("type") == "string" for part in spec.get("anyOf", []))
+        }
         cleaned = {}
         for key, value in raw_params.items():
-            if isinstance(value, str) and value.strip().startswith(("[", "{")):
+            if (
+                key not in string_fields
+                and isinstance(value, str)
+                and value.strip().startswith(("[", "{"))
+            ):
                 try:
                     cleaned[key] = json.loads(value)
                 except (json.JSONDecodeError, ValueError):
