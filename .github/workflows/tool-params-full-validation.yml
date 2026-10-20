@@ -54,19 +54,22 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg xmlsec1
       - name: Frozen dependencies
         run: uv sync --frozen --all-extras --python 3.12
+      - name: Install pinned verification tools
+        run: uv pip install --python .venv/bin/python 'black==25.9.0' 'ruff==0.14.1'
       - name: Check changed files and compare full Ruff findings
         run: |
-          uv run black --check ai_tools/base.py ai_tools/tests/test_base_params.py ai_tools/tests/test_context_tools.py 2>&1 | tee ../../evidence/black.txt
-          uv run ruff check ai_tools/tests/test_base_params.py ai_tools/tests/test_context_tools.py 2>&1 | tee ../../evidence/ruff-tests.txt
+          set -o pipefail
+          uv run --no-sync black --check ai_tools/base.py ai_tools/tests/test_base_params.py ai_tools/tests/test_context_tools.py 2>&1 | tee ../../evidence/black.txt
+          uv run --no-sync ruff check ai_tools/tests/test_base_params.py ai_tools/tests/test_context_tools.py 2>&1 | tee ../../evidence/ruff-tests.txt
           set +e
-          uv run ruff check . --no-fix --output-format json > ../../evidence/ruff-fixed.json
+          uv run --no-sync ruff check . --no-fix --output-format json > ../../evidence/ruff-fixed.json
           fixed_status=$?
           (cd ../../baseline-check/futureagi && ../../source/futureagi/.venv/bin/ruff check . --no-fix --output-format json) > ../../evidence/ruff-baseline.json
           baseline_status=$?
           set -e
           test "$fixed_status" -le 1
           test "$baseline_status" -le 1
-          uv run python - <<'PY'
+          uv run --no-sync python - <<'PY'
           from collections import Counter
           import json
           from pathlib import Path
@@ -103,13 +106,13 @@ jobs:
         run: |
           git show bc09f3b1121cbbcd35c00b5691c52bcd2be90210:futureagi/ai_tools/base.py > ai_tools/base.py
           set +e
-          uv run pytest -q -ra ai_tools/tests/test_base_params.py ai_tools/tests/test_context_tools.py::TestSearchTool --junitxml=../../evidence/original.xml > ../../evidence/original.txt 2>&1
+          uv run --no-sync pytest -q -ra ai_tools/tests/test_base_params.py ai_tools/tests/test_context_tools.py::TestSearchTool --junitxml=../../evidence/original.xml > ../../evidence/original.txt 2>&1
           result=$?
           set -e
           git restore ai_tools/base.py
           tail -30 ../../evidence/original.txt
           test "$result" -eq 1
-          uv run python - <<'PY'
+          uv run --no-sync python - <<'PY'
           import xml.etree.ElementTree as ET
           root = ET.parse('../../evidence/original.xml').getroot()
           cases = list(root.iter('testcase'))
@@ -125,7 +128,7 @@ jobs:
       - name: Run complete ai_tools app suite
         run: |
           set +e
-          uv run pytest -q -ra ai_tools/tests --ignore=ai_tools/tests/live --junitxml=../../evidence/fixed.xml > ../../evidence/fixed.txt 2>&1
+          uv run --no-sync pytest -q -ra ai_tools/tests --ignore=ai_tools/tests/live --junitxml=../../evidence/fixed.xml > ../../evidence/fixed.txt 2>&1
           result=$?
           set -e
           tail -60 ../../evidence/fixed.txt
@@ -133,7 +136,7 @@ jobs:
             git show bc09f3b1121cbbcd35c00b5691c52bcd2be90210:futureagi/ai_tools/base.py > ai_tools/base.py
             git show bc09f3b1121cbbcd35c00b5691c52bcd2be90210:futureagi/ai_tools/tests/test_context_tools.py > ai_tools/tests/test_context_tools.py
             set +e
-            uv run pytest -q -ra ai_tools/tests --ignore=ai_tools/tests/live --ignore=ai_tools/tests/test_base_params.py --junitxml=../../evidence/baseline.xml > ../../evidence/baseline.txt 2>&1
+            uv run --no-sync pytest -q -ra ai_tools/tests --ignore=ai_tools/tests/live --ignore=ai_tools/tests/test_base_params.py --junitxml=../../evidence/baseline.xml > ../../evidence/baseline.txt 2>&1
             baseline_result=$?
             set -e
             git restore ai_tools/base.py ai_tools/tests/test_context_tools.py
