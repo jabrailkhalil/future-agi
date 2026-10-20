@@ -1,0 +1,156 @@
+name: Native tool parameter validation
+
+on:
+  push:
+    branches: [validation/tool-params-full-20261020]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: source/futureagi
+    env:
+      LITELLM_MODE: PRODUCTION
+      CH25_DATABASE: test_tfc
+      CH_DATABASE: test_tfc
+      OBSERVED_CATALOG_TEST_CH_HOST: 127.0.0.1
+      OBSERVED_CATALOG_TEST_CH_PORT: '18123'
+      OBSERVED_CATALOG_TEST_CH_USER: default
+      OBSERVED_CATALOG_TEST_CH_PASSWORD: ''
+      OBSERVED_CATALOG_TEST_NATIVE_PORT: '19000'
+      FI_CH_TEST_SIDECAR_NATIVE_PORT: '19000'
+      FI_CH_TEST_SIDECAR_HTTP_PORT: '18123'
+      PYTHONHASHSEED: '0'
+      FI_CH25_SCHEMA_APPLY_STRICT: '1'
+      MINIO_URL: localhost:19005
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 043406a63bc788a62a4b3f906db5294376a4dbdb
+          path: source
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Record exact source and baseline
+        working-directory: source
+        run: |
+          mkdir -p ../evidence
+          git rev-parse HEAD | tee ../evidence/source-sha.txt
+          git ls-tree -r HEAD > ../evidence/source-tree.txt
+          git worktree add --detach ../baseline-check bc09f3b1121cbbcd35c00b5691c52bcd2be90210
+          git worktree add --detach ../fixed-check 043406a63bc788a62a4b3f906db5294376a4dbdb
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: source/futureagi/uv.lock
+      - name: Install runtime libraries
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ffmpeg xmlsec1
+      - name: Frozen dependencies
+        run: uv sync --frozen --all-extras --python 3.12
+      - name: Check changed files and compare full Ruff findings
+        run: |
+          uv run black --check ai_tools/base.py ai_tools/tests/test_base_params.py ai_tools/tests/test_context_tools.py 2>&1 | tee ../../evidence/black.txt
+          uv run ruff check ai_tools/tests/test_base_params.py ai_tools/tests/test_context_tools.py 2>&1 | tee ../../evidence/ruff-tests.txt
+          set +e
+          uv run ruff check . --no-fix --output-format json > ../../evidence/ruff-fixed.json
+          fixed_status=$?
+          (cd ../../baseline-check/futureagi && ../../source/futureagi/.venv/bin/ruff check . --no-fix --output-format json) > ../../evidence/ruff-baseline.json
+          baseline_status=$?
+          set -e
+          test "$fixed_status" -le 1
+          test "$baseline_status" -le 1
+          uv run python - <<'PY'
+          from collections import Counter
+          import json
+          from pathlib import Path
+          out = Path('../../evidence')
+          def findings(name, directory):
+              rows = json.loads((out / name).read_text())
+              root = Path(directory).resolve()
+              return Counter((str(Path(x['filename']).relative_to(root)), x['code'], x['message']) for x in rows)
+          fixed = findings('ruff-fixed.json', '.')
+          baseline = findings('ruff-baseline.json', '../../baseline-check/futureagi')
+          new = fixed - baseline
+          result = {'fixed_findings': sum(fixed.values()), 'baseline_findings': sum(baseline.values()), 'new_findings': sum(new.values()), 'new': [list(k) + [v] for k, v in new.items()]}
+          (out / 'ruff-comparison.json').write_text(json.dumps(result, indent=2))
+          print(json.dumps(result, indent=2))
+          assert not new, result
+          PY
+      - name: Record make check-all on baseline and fixed disposable worktrees
+        run: |
+          export PATH="$PWD/.venv/bin:$PATH"
+          set +e
+          (cd ../../baseline-check/futureagi && make check-all) > ../../evidence/check-all-baseline.txt 2>&1
+          baseline_status=$?
+          (cd ../../fixed-check/futureagi && make check-all) > ../../evidence/check-all-fixed.txt 2>&1
+          fixed_status=$?
+          set -e
+          printf 'baseline=%s\nfixed=%s\n' "$baseline_status" "$fixed_status" | tee ../../evidence/check-all-status.txt
+          tail -12 ../../evidence/check-all-baseline.txt
+          tail -12 ../../evidence/check-all-fixed.txt
+          # A baseline failure is reported as such, never counted as passing.
+          if [ "$baseline_status" -eq 0 ]; then test "$fixed_status" -eq 0; fi
+      - name: Start real disposable test services
+        run: docker compose -f docker-compose.test.yml -p futureagi-test up -d --wait --wait-timeout 180
+      - name: Prove regression against original source
+        run: |
+          git show bc09f3b1121cbbcd35c00b5691c52bcd2be90210:futureagi/ai_tools/base.py > ai_tools/base.py
+          set +e
+          uv run pytest -q -ra ai_tools/tests/test_base_params.py ai_tools/tests/test_context_tools.py::TestSearchTool --junitxml=../../evidence/original.xml > ../../evidence/original.txt 2>&1
+          result=$?
+          set -e
+          git restore ai_tools/base.py
+          tail -30 ../../evidence/original.txt
+          test "$result" -eq 1
+          uv run python - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse('../../evidence/original.xml').getroot()
+          cases = list(root.iter('testcase'))
+          failures = [c for c in cases if c.find('failure') is not None]
+          assert not list(root.iter('error')), 'Collection/setup errors are not regression evidence'
+          assert not list(root.iter('skipped'))
+          expected = {'test_json_text_is_preserved', 'test_nullable_string_is_preserved_alongside_structured_fields', 'test_string_or_structure_keeps_the_supplied_value_type'}
+          assert len(cases) == 7, len(cases)
+          assert len(failures) == 5, [(c.get('name'), len(c)) for c in cases]
+          assert all(any(name in c.get('name', '') for name in expected) or 'test_search_preserves_literal_json_query' in c.get('name', '') for c in failures)
+          print('Original source: 5 failing regression cases, 2 passing controls, no errors/skips')
+          PY
+      - name: Run complete ai_tools app suite
+        run: |
+          set +e
+          uv run pytest -q -ra ai_tools/tests --ignore=ai_tools/tests/live --junitxml=../../evidence/fixed.xml > ../../evidence/fixed.txt 2>&1
+          result=$?
+          set -e
+          tail -60 ../../evidence/fixed.txt
+          if [ "$result" -ne 0 ]; then
+            git show bc09f3b1121cbbcd35c00b5691c52bcd2be90210:futureagi/ai_tools/base.py > ai_tools/base.py
+            git show bc09f3b1121cbbcd35c00b5691c52bcd2be90210:futureagi/ai_tools/tests/test_context_tools.py > ai_tools/tests/test_context_tools.py
+            set +e
+            uv run pytest -q -ra ai_tools/tests --ignore=ai_tools/tests/live --ignore=ai_tools/tests/test_base_params.py --junitxml=../../evidence/baseline.xml > ../../evidence/baseline.txt 2>&1
+            baseline_result=$?
+            set -e
+            git restore ai_tools/base.py ai_tools/tests/test_context_tools.py
+            printf 'baseline=%s\nfixed=%s\n' "$baseline_result" "$result" > ../../evidence/suite-status.txt
+            tail -60 ../../evidence/baseline.txt
+          fi
+          exit "$result"
+      - name: Check source stayed clean
+        if: always()
+        run: git diff --exit-code
+      - name: Logs on failure
+        if: failure()
+        run: docker compose -f docker-compose.test.yml -p futureagi-test logs --tail 60
+      - name: Upload validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-tool-parameter-full-validation
+          path: evidence/
+          if-no-files-found: error
